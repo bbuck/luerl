@@ -33,6 +33,9 @@
 -define(TMPNAM_MAXTRIES, 100).
 -define(TMPNAM_TEMPLATE(S), "/tmp/lua_" ++ S).
 
+%% For `unix_timestamp_to_erlang_timestamp/1` in `luerl_lib_os`.
+-define(MEGA_SECOND, 1000000).
+
 install(St) ->
     luerl_emul:alloc_table(table(), St).
 
@@ -225,7 +228,7 @@ clock(As, St) ->
     {Tot,_} = erlang:statistics(Type),		%Milliseconds
     {[Tot*1.0e-3],St}.
 
-%% date([FmtStr], State)
+%% date([FmtStr,UnixTimestamp|_], State)
 %%  This will process the format string and return a new string with date values
 %%  substitued, for example "%H:%M" will become "19:08". Refer to
 %%  format_date_part/2 for details on what format characters relate to what
@@ -234,30 +237,62 @@ clock(As, St) ->
 %%  date information. The keys returned are sec, min, hour, day, month, year,
 %%  wday (day in week), yday (day in year) and isdst.
 %%  NOTE: For *t, isdst is not yet implemented.
+date([<<"*t">>, UnixTimestamp|_], StateIn) ->
+    Timestamp = unix_timestamp_to_erlang_timestamp(UnixTimestamp),
+    {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:now_to_local_time(Timestamp),
+    {T, StateOut} = luerl_emul:alloc_table(date_info_table({Ye, Mo, Da, Ho, Mi, Sec}), StateIn),
+    {[T], StateOut};
 date([<<"*t">>|_], StateIn) ->
     {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:local_time(),
+    {T, StateOut} = luerl_emul:alloc_table(date_info_table({Ye, Mo, Da, Ho, Mi, Sec}), StateIn),
+    {[T], StateOut};
+date([FmtStr, UnixTimestamp|_], St) ->
+    Timestamp = unix_timestamp_to_erlang_timestamp(UnixTimestamp),
+    {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:now_to_local_time(Timestamp),
+    Str = process_format_str({Ye, Mo, Da, Ho, Mi, Sec}, FmtStr),
+    {[Str], St};
+date([FmtStr|_], St) ->
+    {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:local_time(),
+    Str = process_format_str({Ye, Mo, Da, Ho, Mi, Sec}, FmtStr),
+    {[Str], St}.
+
+%% unix_timestamp_to_erlang_timestamp(Unix)
+%%  Convert a unix timestamp (single integer value) into an Erlang Timestamp,
+%%  matching the return value of `os:timestamp/0`. Basically breaking it apart
+%%  into Mega Seconds (1,000,000 seconds) and seconds. The return value always
+%%  uses 0 for Micro Seconds (.000001th of a second).
+unix_timestamp_to_erlang_timestamp(Unix) ->
+    UnixInt = floor(Unix),
+    Mega = UnixInt div ?MEGA_SECOND,
+    MegaTotal = Mega * ?MEGA_SECOND,
+    Sec = UnixInt - MegaTotal,
+    {Mega, Sec, 0}.
+
+%% date_info_table(DateParts)
+%%  Take the date parts (year, month, day, hour, minute, second) and build a
+%%  Lua table out of them matching the expected return value of Lua's `os.date`
+%%  with the special format "*t"
+date_info_table({Ye, Mo, Da, Ho, Mi, Sec}) ->
     WeekDay = calendar:day_of_the_week({Ye, Mo, Da}),
     YearDaysStart = calendar:date_to_gregorian_days({Ye, 1, 1}),
     YearDaysEnd = calendar:date_to_gregorian_days({Ye, Mo, Da}),
-    {T, StateOut} = luerl_emul:alloc_table([
-                {<<"sec">>, Sec},
-                {<<"min">>, Mi},
-                {<<"hour">>, Ho},
-                {<<"day">>, Da},
-                {<<"month">>, Mo},
-                {<<"year">>, Ye},
-                {<<"wday">>, WeekDay rem 7},
-                {<<"yday">>, YearDaysEnd-YearDaysStart+1},
-                {<<"isdst">>, <<"N/I">>}
-            ], StateIn),
-    {[T], StateOut};
-date([FmtStr | _], St) ->
-    {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:local_time(),
-    Str = process_format_str({Ye, Mo, Da, Ho, Mi, Sec}, FmtStr),
-    % io_lib:fwrite("~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w",
-    %   [Ye, Mo, Da, Ho, Mi, Sec]),
-    {[Str], St}.
+    [
+        {<<"sec">>, Sec},
+        {<<"min">>, Mi},
+        {<<"hour">>, Ho},
+        {<<"day">>, Da},
+        {<<"month">>, Mo},
+        {<<"year">>, Ye},
+        {<<"wday">>, WeekDay rem 7},
+        {<<"yday">>, YearDaysEnd-YearDaysStart+1},
+        {<<"isdst">>, <<"N/I">>}
+    ].
 
+%% process_format_sgr(DateParts, FmtStr)
+%%  Process the format string for the format patterns defined by Lua which are
+%%  character combinations beginning with % and containing various characters
+%%  mapping to a desired date value. `process_format_str/2` is a helper function
+%%  that uses a regular expression to target all the format specifications.
 process_format_str(DateParts, FmtStr) ->
     case re:run(FmtStr, "%.", [global]) of
         {match, Results} ->
@@ -266,6 +301,9 @@ process_format_str(DateParts, FmtStr) ->
             FmtStr
     end.
 
+%% process_format_str(DateParts, FmtStr, FormatRules, LastEnd, Result)
+%%  Process the format rules in the string and convert them into the string
+%%  representations of their respective date values.
 process_format_str(_, FmtStr, [], LastEnd, Result) ->
     End = string:slice(FmtStr, LastEnd),
     iolist_to_binary(lists:reverse([End|Result]));
@@ -421,6 +459,8 @@ month_name(12, false) -> "December".
 difftime([A1,A2|_], St) ->
     {[A2-A1],St}.
 
-time(_, St) ->					%Time since 1 Jan 1970
-    {Mega,Sec,Micro} = os:timestamp(),
-    {[1.0e6*Mega+Sec+Micro*1.0e-6],St}.
+%% time(_, State)
+%%  Returns the time since 1 Jan 1970 in the "Unix" Timestamp flavor.
+time(_, St) ->
+    {Mega,Sec,_} = os:timestamp(),
+    {[?MEGA_SECOND*Mega+Sec],St}.
