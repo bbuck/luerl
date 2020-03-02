@@ -22,6 +22,8 @@
 
 -export([install/1]).
 
+-export([process_format_str/2, process_format_str/5, format_date_part/2]).
+
 -import(luerl_lib, [lua_error/2,badarg_error/3]).	%Shorten this
 
 %% For `remove/2'.
@@ -223,11 +225,198 @@ clock(As, St) ->
     {Tot,_} = erlang:statistics(Type),		%Milliseconds
     {[Tot*1.0e-3],St}.
 
-date(_, St) ->
-    {{Ye,Mo,Da},{Ho,Mi,Sec}} = calendar:local_time(),
-    Str = io_lib:fwrite("~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w",
-                        [Ye,Mo,Da,Ho,Mi,Sec]),
-    {[iolist_to_binary(Str)],St}.
+%% date([FmtStr], State)
+%%  This will process the format string and return a new string with date values
+%%  substitued, for example "%H:%M" will become "19:08". Refer to
+%%  format_date_part/2 for details on what format characters relate to what
+%%  date values.
+%%  There is a special format string, "*t", which returns a table containing
+%%  date information. The keys returned are sec, min, hour, day, month, year,
+%%  wday (day in week), yday (day in year) and isdst.
+%%  NOTE: For *t, isdst is not yet implemented.
+date([<<"*t">>|_], StateIn) ->
+    {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:local_time(),
+    WeekDay = calendar:day_of_the_week({Ye, Mo, Da}),
+    YearDaysStart = calendar:date_to_gregorian_days({Ye, 1, 1}),
+    YearDaysEnd = calendar:date_to_gregorian_days({Ye, Mo, Da}),
+    {T, StateOut} = luerl_emul:alloc_table([
+                {<<"sec">>, Sec},
+                {<<"min">>, Mi},
+                {<<"hour">>, Ho},
+                {<<"day">>, Da},
+                {<<"month">>, Mo},
+                {<<"year">>, Ye},
+                {<<"wday">>, WeekDay rem 7},
+                {<<"yday">>, YearDaysEnd-YearDaysStart+1},
+                {<<"isdst">>, <<"N/I">>}
+            ], StateIn),
+    {[T], StateOut};
+date([FmtStr | _], St) ->
+    {{Ye, Mo, Da}, {Ho, Mi, Sec}} = calendar:local_time(),
+    Str = process_format_str({Ye, Mo, Da, Ho, Mi, Sec}, FmtStr),
+    % io_lib:fwrite("~w-~.2.0w-~.2.0w ~.2.0w:~.2.0w:~.2.0w",
+    %   [Ye, Mo, Da, Ho, Mi, Sec]),
+    {[Str], St}.
+
+process_format_str(DateParts, FmtStr) ->
+    case re:run(FmtStr, "%.", [global]) of
+        {match, Results} ->
+            process_format_str(DateParts, FmtStr, Results, 0, []);
+        _ ->
+            FmtStr
+    end.
+
+process_format_str(_, FmtStr, [], LastEnd, Result) ->
+    End = string:slice(FmtStr, LastEnd),
+    iolist_to_binary(lists:reverse([End|Result]));
+process_format_str(DateParts, FmtStr, [[{MStart, MLen}]|Rest], LastEnd, Result) ->
+    Start = if
+        MStart == 0 ->
+            "";
+        true ->
+            string:slice(FmtStr, LastEnd, MStart-LastEnd)
+    end,
+    Char = string:slice(FmtStr, MStart+1, 1),
+    FmtDatePart = format_date_part(DateParts, Char),
+    process_format_str(DateParts, FmtStr, Rest, MStart+MLen, [FmtDatePart|[Start|Result]]).
+
+%% format_date_part(DateParts, FormatDirective)
+%%  Convert format directing like I into it's respective date component.
+%%  a is the day of the week, abbreviated; e.g. Wed
+%%  A is the day of the week, full; e.g. Wednesday
+%%  H is 24-hour hour value, zero-padded.
+%%  I is 12-hour hour value, zero-padded
+%%  M is zero-padded minute
+%%  S is zero-padded seconds
+%%  j is the day of the year, 1-366
+%%  w is weekday as number, 0 - 6, Sunday is 0
+%%  y is the year without century, last two digits (00 - 99) e.g. 20
+%%  Y is the year with century, e.g. 2020
+%%  c is a locale specific date/time string (NOTE: not locale aware right now)
+%%  x is a locale specific date format (NOTE: not locale aware right now)
+%%  X is a locale specific time format (NOTE: not locale aware right now)
+%%  Z is the time zone in abbreviated format, e.g. CST or nothing if the time
+%%    zone is unknown. (NOTE: Not yet implemented)
+%%  U is the week of the year assuming Sunday is the first day of the week (00 - 53)
+%%  W is the week of the year assuming Monday is the first day of the week (00 - 53)
+%%  % means the previous char was %, and %% -> %
+format_date_part({_, _, Da, _, _, _}, <<"d">>) ->
+    io_lib:fwrite("~.2.0w", [Da]);
+format_date_part({_, _, _, Ho, _, _}, <<"H">>) ->
+    io_lib:fwrite("~.2.0w", [Ho]);
+format_date_part({_, _, _, Ho, _, _}, <<"I">>) ->
+    TwHo = Ho rem 12,
+    TwHo1 = if
+        TwHo == 0 -> 12;
+        true -> TwHo
+    end,
+    io_lib:fwrite("~.2.0w", [TwHo1]);
+format_date_part({_, Mo, _, _, _, _}, <<"m">>) ->
+    io_lib:fwrite("~.2.0w", [Mo]);
+format_date_part({_, _, _, _, Mi, _}, <<"M">>) ->
+    io_lib:fwrite("~.2.0w", [Mi]);
+format_date_part({_, _, _, _, _, Sec}, <<"S">>) ->
+    io_lib:fwrite("~.2.0w", [Sec]);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"a">>) ->
+    Day = calendar:day_of_the_week({Ye, Mo, Da}),
+    day_name(Day, true);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"A">>) ->
+    Day = calendar:day_of_the_week({Ye, Mo, Da}),
+    day_name(Day, false);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"w">>) ->
+    Day = calendar:day_of_the_week({Ye, Mo, Da}),
+    io_lib:fwrite("~w", [Day rem 7]);
+format_date_part({_, Mo, _, _, _, _}, <<"b">>) ->
+    month_name(Mo, true);
+format_date_part({_, Mo, _, _, _, _}, <<"B">>) ->
+    month_name(Mo, false);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"j">>) ->
+    YearStart = calendar:date_to_gregorian_days({Ye, 1, 1}),
+    Today = calendar:date_to_gregorian_days({Ye, Mo, Da}),
+    io_lib:fwrite("~.3.0w", [Today-YearStart+1]);
+format_date_part({Ye, _, _, _, _, _}, <<"y">>) ->
+    io_lib:fwrite("~.2.0w", [Ye rem 100]);
+format_date_part({Ye, _, _, _, _, _}, <<"Y">>) ->
+    io_lib:fwrite("~w", [Ye]);
+format_date_part({Ye, Mo, Da, Ho, Mi, Sec}, <<"c">>) ->
+    DayNum = calendar:day_of_the_week({Ye, Mo, Da}),
+    Day = day_name(DayNum, true),
+    Month = month_name(Mo, true),
+    io_lib:fwrite("~s ~s ~.2. w ~.2.0w:~.2.0w:~.2.0w ~w", [Day, Month, Da, Ho, Mi, Sec, Ye]);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"x">>) ->
+    io_lib:fwrite("~.2.0w/~.2.0w/~.2.0w", [Mo, Da, Ye rem 100]);
+format_date_part({_, _, _, Ho, Mi, Sec}, <<"X">>) ->
+    io_lib:fwrite("~.2.0w:~.2.0w:~.2.0w", [Ho, Mi, Sec]);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"U">>) ->
+    {_, WeekNum} = calendar:iso_week_number({Ye, Mo, Da}),
+    io_lib:fwrite("~.2.0w", [WeekNum]);
+format_date_part({Ye, Mo, Da, _, _, _}, <<"W">>) ->
+    {_, WeekNum} = calendar:iso_week_number({Ye, Mo, Da}),
+    DayNum = calendar:day_of_the_week({Ye, Mo, Da}),
+    ActualWeekNum0 = case DayNum of
+        % it's not Monday yet, so we don't count this new week
+        7 -> WeekNum-1;
+        _ -> WeekNum
+    end,
+    ActualWeekNum1 = if
+        ActualWeekNum0 < 0 -> 0;
+        true -> ActualWeekNum0
+    end,
+    io_lib:fwrite("~.2.0w", [ActualWeekNum1]);
+format_date_part({_, _, _, Ho, _, _}, <<"p">>) when Ho < 12 ->
+    "AM";
+format_date_part(_, <<"p">>) ->
+    "PM";
+format_date_part(_, <<"%">>) ->
+    "%";
+format_date_part(_, Char) ->
+    "%" ++ Char.
+
+%% day_name(DayNum, Abbreviated)
+%%  Convert a day number into an abbreviated/full representation.
+%%  NOTE: as of now, this is not locale aware
+day_name(1, true) -> "Mon";
+day_name(1, false) -> "Monday";
+day_name(2, true) -> "Tue";
+day_name(2, false) -> "Tuesday";
+day_name(3, true) -> "Wed";
+day_name(3, false) -> "Wednesday";
+day_name(4, true) -> "Thu";
+day_name(4, false) -> "Thursday";
+day_name(5, true) -> "Fri";
+day_name(5, false) -> "Friday";
+day_name(6, true) -> "Sat";
+day_name(6, false) -> "Saturday";
+day_name(7, true) -> "Sun";
+day_name(7, false) -> "Sunday".
+
+%% month_name(Month, Abbreviated)
+%%  Convert a month number into an abbreviated/full representation.
+%%  NOTE: as of now, this is not locale aware
+month_name(1, true) -> "Jan";
+month_name(1, false) -> "January";
+month_name(2, true) -> "Feb";
+month_name(2, false) -> "February";
+month_name(3, true) -> "Mar";
+month_name(3, false) -> "March";
+month_name(4, true) -> "Apr";
+month_name(4, false) -> "April";
+month_name(5, true) -> "May";
+month_name(5, false) -> "May";
+month_name(6, true) -> "Jun";
+month_name(6, false) -> "June";
+month_name(7, true) -> "Jul";
+month_name(7, false) -> "July";
+month_name(8, true) -> "Aug";
+month_name(8, false) -> "August";
+month_name(9, true) -> "Sep";
+month_name(9, false) -> "September";
+month_name(10, true) -> "Oct";
+month_name(10, false) -> "October";
+month_name(11, true) -> "Nov";
+month_name(11, false) -> "November";
+month_name(12, true) -> "Dec";
+month_name(12, false) -> "December".
 
 difftime([A1,A2|_], St) ->
     {[A2-A1],St}.
