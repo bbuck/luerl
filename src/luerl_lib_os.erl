@@ -288,7 +288,7 @@ date_info_table({Ye, Mo, Da, Ho, Mi, Sec}) ->
         {<<"isdst">>, <<"N/I">>}
     ].
 
-%% process_format_sgr(DateParts, FmtStr)
+%% process_format_str(DateParts, FmtStr)
 %%  Process the format string for the format patterns defined by Lua which are
 %%  character combinations beginning with % and containing various characters
 %%  mapping to a desired date value. `process_format_str/2` is a helper function
